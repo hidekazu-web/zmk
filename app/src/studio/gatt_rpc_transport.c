@@ -68,6 +68,16 @@ static ssize_t write_rpc_req(struct bt_conn *conn, const struct bt_gatt_attr *at
 
     uint32_t copied = 0;
     struct ring_buf *rpc_buf = zmk_rpc_get_rx_buf();
+
+    /* This callback runs on the Bluetooth RX thread. If the RPC thread has stopped
+     * draining the RX ring buffer, the copy loop below would spin forever and take
+     * the whole Bluetooth stack down with it. Only the RPC thread removes data, so
+     * free space can only grow after this check: once it passes, the loop ends. */
+    if (ring_buf_space_get(rpc_buf) < len) {
+        LOG_WRN("RPC RX buffer full, rejecting %d bytes", len);
+        return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
+    }
+
     while (copied < len) {
         uint8_t *buffer;
         uint32_t claim_len = ring_buf_put_claim(rpc_buf, &buffer, len - copied);
@@ -135,24 +145,48 @@ static struct bt_gatt_indicate_params rpc_indicate_params = {
     .func = indicate_cb,
 };
 
+/* How long a chunk the Bluetooth stack could not take right now is retried before the
+ * queued response is dropped. */
+#define INDICATE_RETRY_DELAY K_MSEC(20)
+#define INDICATE_RETRY_LIMIT_MS 2000
+
+/* A chunk already taken out of the TX ring buffer that the Bluetooth stack has not
+ * accepted yet. Like the ring buffer's read side, only touched on the system work
+ * queue thread (notif_rpc_tx_cb). */
+static uint16_t indicate_held_len;
+static int64_t indicate_held_since;
+
+static void notify_tx_retry_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(notify_tx_retry_work, notify_tx_retry_cb);
+
+/* Throw away everything queued for sending. Reads from the consumer side instead of
+ * ring_buf_reset() because the RPC thread may be in the middle of writing. */
+static void discard_tx(struct ring_buf *tx_buf) {
+    indicate_held_len = 0;
+    ring_buf_get(tx_buf, NULL, ring_buf_size_get(tx_buf));
+}
+
 static void notif_rpc_tx_cb(struct k_work *work) {
     struct bt_conn *conn = zmk_ble_active_profile_conn();
     struct ring_buf *tx_buf = zmk_rpc_get_tx_buf();
 
     if (!conn) {
         LOG_WRN("No active connection for queued data, dropping");
-        ring_buf_reset(tx_buf);
+        discard_tx(tx_buf);
         return;
     }
 
-    uint16_t notify_size = MIN(get_notify_size_for_conn(conn), sizeof(indicate_buffer));
+    if (indicate_held_len == 0 && ring_buf_size_get(tx_buf) == 0) {
+        goto out;
+    }
 
-    if (ring_buf_size_get(tx_buf) > 0) {
-        int ret = k_sem_take(&indicate_sem, K_NO_WAIT);
-        if (ret < 0) {
-            return;
-        }
+    /* An indication is still waiting for its confirmation; indicate_cb() resubmits. */
+    if (k_sem_take(&indicate_sem, K_NO_WAIT) < 0) {
+        goto out;
+    }
 
+    if (indicate_held_len == 0) {
+        uint16_t notify_size = MIN(get_notify_size_for_conn(conn), sizeof(indicate_buffer));
         uint16_t added = 0;
         while (added < notify_size && ring_buf_size_get(tx_buf) > 0) {
             uint8_t *buf;
@@ -164,19 +198,39 @@ static void notif_rpc_tx_cb(struct k_work *work) {
             ring_buf_get_finish(tx_buf, len);
         }
 
-        rpc_indicate_params.len = added;
-
-        int err = bt_gatt_indicate(conn, &rpc_indicate_params);
-        if (err < 0) {
-            LOG_WRN("Failed to notify the response %d", err);
-            k_sem_give(&indicate_sem);
-        }
+        indicate_held_len = added;
+        indicate_held_since = k_uptime_get();
     }
 
+    rpc_indicate_params.len = indicate_held_len;
+
+    int err = bt_gatt_indicate(conn, &rpc_indicate_params);
+    if (err == 0) {
+        /* indicate_cb() releases the semaphore and continues with the next chunk. */
+        indicate_held_len = 0;
+        goto out;
+    }
+
+    k_sem_give(&indicate_sem);
+
+    /* Nothing calls us again after a failed indication unless we arrange it, and the
+     * RPC thread waits forever for the TX ring buffer to drain. So either try this
+     * chunk again shortly, or give the queued response up so the writer can go on. */
+    bool transient = (err == -ENOMEM || err == -EAGAIN);
+    if (transient && k_uptime_get() - indicate_held_since < INDICATE_RETRY_LIMIT_MS) {
+        k_work_reschedule(&notify_tx_retry_work, INDICATE_RETRY_DELAY);
+    } else {
+        LOG_WRN("Failed to notify the response %d, dropping queued data", err);
+        discard_tx(tx_buf);
+    }
+
+out:
     bt_conn_unref(conn);
 }
 
 static K_WORK_DEFINE(notify_tx_work, notif_rpc_tx_cb);
+
+static void notify_tx_retry_cb(struct k_work *work) { k_work_submit(&notify_tx_work); }
 
 struct gatt_write_state {
     size_t pending_notify;
@@ -194,7 +248,13 @@ static void gatt_tx_notify(struct ring_buf *tx_buf, size_t added, bool msg_done,
 
     atomic_t ns = atomic_get(&notify_size);
 
-    if (msg_done || state->pending_notify > ns) {
+    /* rpc.c calls with added == 0 when the TX ring buffer is full and it is waiting
+     * for room. That must always start a flush: pending_notify is usually below the
+     * threshold at that point, and if the chain of indications has stopped nothing
+     * else would ever drain the buffer. */
+    bool waiting_for_room = (added == 0);
+
+    if (msg_done || waiting_for_room || state->pending_notify > ns) {
         if (k_current_get() == k_work_queue_thread_get(&k_sys_work_q)) {
             /* We are already running on the system work queue (e.g. a Studio RPC
              * notification raised from a listener on that queue). Submitting
